@@ -1,13 +1,13 @@
-"""Stormfront risk surface lens — per-grid-point categorical risk.
+"""Stormfront risk surface lens — per-day × per-grid-point categorical risk.
 
 Reads every `stormfront_convective` siphon source across the southern UK
-sample grid and produces a GeoJSON FeatureCollection with one point per
-sample, tagged with today's peak CAPE / shear / LPI and the derived
-categorical level.
+sample grid and produces a **5-day** stack of GeoJSON FeatureCollections
+— one per day — each with one point per sample, tagged with that day's
+peak CAPE / shear / LPI and the derived categorical level.
 
-The chaseit /outlook page renders this as a mini risk-surface map above
-the 5-day cards, so chasers can see the spatial distribution of risk at
-a glance.
+The chaseit /outlook page renders this as a scrubbable risk-surface map:
+click "Today", "Tomorrow", ... to see how the spatial risk distribution
+evolves through the week.
 
 Points (as of Phase 2C):
 
@@ -20,7 +20,7 @@ Points (as of Phase 2C):
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 
 from .base import BaseLens, register
 
@@ -46,71 +46,110 @@ class StormfrontRiskSurfaceLens(BaseLens):
     AUTO_SEED = False
 
     async def compute(self, data: dict) -> dict:
-        features: list[dict] = []
         today = datetime.now(timezone.utc).date()
+        target_dates = [today + timedelta(days=i) for i in range(5)]
 
-        level_counts = {
-            "none": 0,
-            "mrgl": 0,
-            "slgt": 0,
-            "enh": 0,
-            "mdt": 0,
-            "high": 0,
-        }
-        max_level_value = 0
-        max_level_key = "none"
-
+        # Pre-group every point's hourly data by date so we only iterate
+        # each upstream response once.
+        per_point_hours: dict[str, dict[date, list[dict]]] = {}
         for point in GRID_POINTS:
             input_key = f"stormfront/convective/{point['key']}"
             upstream = data.get(input_key) or {}
             hourly = upstream.get("hourly") or []
-            todays = [h for h in hourly if _day_of(h) == today]
+            by_day: dict[date, list[dict]] = {}
+            for h in hourly:
+                d = _day_of(h)
+                if d is None:
+                    continue
+                by_day.setdefault(d, []).append(h)
+            per_point_hours[point["key"]] = by_day
 
-            peak_cape = 0.0
-            peak_shear = 0.0
-            peak_lpi = 0.0
-            peak_hour: str | None = None
-            precip = 0.0
-            for h in todays:
-                c = float(h.get("cape_j_kg") or 0.0)
-                s = float(h.get("shear_0_6km_ms") or 0.0)
-                lp = float(h.get("lightning_potential") or 0.0)
-                if c > peak_cape:
-                    peak_cape = c
-                    peak_hour = _hour_of(h)
-                if s > peak_shear:
-                    peak_shear = s
-                if lp > peak_lpi:
-                    peak_lpi = lp
-                precip += float(h.get("precip_mm") or 0.0)
+        days_out: list[dict] = []
+        overall_max_value = 0
+        overall_max_key = "none"
 
-            level = _categorical(peak_cape, peak_shear)
-            level_counts[level] = level_counts.get(level, 0) + 1
-            value = _LEVEL_VALUE[level]
-            if value > max_level_value:
-                max_level_value = value
-                max_level_key = level
+        for d in target_dates:
+            features: list[dict] = []
+            level_counts = {
+                "none": 0,
+                "mrgl": 0,
+                "slgt": 0,
+                "enh": 0,
+                "mdt": 0,
+                "high": 0,
+            }
+            day_max_value = 0
+            day_max_key = "none"
 
-            features.append(
+            for point in GRID_POINTS:
+                rows = per_point_hours.get(point["key"], {}).get(d, [])
+                peak_cape = 0.0
+                peak_shear = 0.0
+                peak_lpi = 0.0
+                peak_hour: str | None = None
+                precip = 0.0
+                for h in rows:
+                    c = float(h.get("cape_j_kg") or 0.0)
+                    s = float(h.get("shear_0_6km_ms") or 0.0)
+                    lp = float(h.get("lightning_potential") or 0.0)
+                    if c > peak_cape:
+                        peak_cape = c
+                        peak_hour = _hour_of(h)
+                    if s > peak_shear:
+                        peak_shear = s
+                    if lp > peak_lpi:
+                        peak_lpi = lp
+                    precip += float(h.get("precip_mm") or 0.0)
+
+                level = _categorical(peak_cape, peak_shear)
+                level_counts[level] = level_counts.get(level, 0) + 1
+                value = _LEVEL_VALUE[level]
+                if value > day_max_value:
+                    day_max_value = value
+                    day_max_key = level
+
+                features.append(
+                    {
+                        "type": "Feature",
+                        "geometry": {
+                            "type": "Point",
+                            "coordinates": [point["lon"], point["lat"]],
+                        },
+                        "properties": {
+                            "key": point["key"],
+                            "label": point["label"],
+                            "level": level,
+                            "peak_cape": round(peak_cape, 0),
+                            "peak_shear": round(peak_shear, 1),
+                            "peak_lpi": round(peak_lpi, 2),
+                            "peak_hour": peak_hour,
+                            "precip_mm": round(precip, 1),
+                            "upstream_ok": bool(rows),
+                        },
+                    }
+                )
+
+            days_out.append(
                 {
-                    "type": "Feature",
-                    "geometry": {
-                        "type": "Point",
-                        "coordinates": [point["lon"], point["lat"]],
-                    },
-                    "properties": {
-                        "key": point["key"],
-                        "label": point["label"],
-                        "level": level,
-                        "peak_cape": round(peak_cape, 0),
-                        "peak_shear": round(peak_shear, 1),
-                        "peak_lpi": round(peak_lpi, 2),
-                        "peak_hour": peak_hour,
-                        "precip_mm": round(precip, 1),
-                        "upstream_ok": bool(todays),
-                    },
+                    "date": d.isoformat(),
+                    "day_label": _day_label(d, today),
+                    "max_level": day_max_key,
+                    "level_counts": level_counts,
+                    "features": features,
                 }
             )
+
+            if day_max_value > overall_max_value:
+                overall_max_value = day_max_value
+                overall_max_key = day_max_key
+
+        today_features = days_out[0]["features"] if days_out else []
+        today_counts = (
+            days_out[0]["level_counts"]
+            if days_out
+            else {k: 0 for k in _LEVEL_VALUE}
+        )
+        today_max = days_out[0]["max_level"] if days_out else "none"
 
         return {
             "updated": datetime.now(timezone.utc).isoformat(),
@@ -122,14 +161,15 @@ class StormfrontRiskSurfaceLens(BaseLens):
                 "south": 49.8,
                 "north": 53.2,
             },
-            "features": features,
-            "feature_collection": {
-                "type": "FeatureCollection",
-                "features": features,
-            },
-            "max_level": max_level_key,
-            "level_counts": level_counts,
-            "point_count": len(features),
+            # Today-only fields kept for backwards compat with the v1
+            # /api/risk-surface shape consumed by chaseit before 5-day support.
+            "features": today_features,
+            "max_level": today_max,
+            "level_counts": today_counts,
+            "point_count": len(today_features),
+            # New v2 fields — scrubbable 5-day stack.
+            "days": days_out,
+            "overall_max_level": overall_max_key,
         }
 
 
@@ -165,6 +205,14 @@ def _day_of(h: dict) -> date | None:
         return datetime.fromisoformat(t).date()
     except ValueError:
         return None
+
+
+def _day_label(d: date, today: date) -> str:
+    if d == today:
+        return "Today"
+    if d == today + timedelta(days=1):
+        return "Tomorrow"
+    return d.strftime("%A")
 
 
 def _hour_of(h: dict) -> str | None:
