@@ -69,8 +69,12 @@ class StormfrontConvectiveSource(BaseSource):
                 "cape",
                 "convective_inhibition",
                 "lifted_index",
+                "lightning_potential",
+                "freezing_level_height",
+                "boundary_layer_height",
                 "wind_speed_10m",
                 "wind_direction_10m",
+                "wind_gusts_10m",
                 "wind_speed_925hPa",
                 "wind_direction_925hPa",
                 "wind_speed_700hPa",
@@ -105,12 +109,16 @@ class StormfrontConvectiveSource(BaseSource):
         cape = h.get("cape") or []
         cin = h.get("convective_inhibition") or []
         li = h.get("lifted_index") or []
+        lpi = h.get("lightning_potential") or []
+        fl = h.get("freezing_level_height") or []
+        blh = h.get("boundary_layer_height") or []
         precip = h.get("precipitation") or []
         cloud = h.get("cloud_cover") or []
         t2m = h.get("temperature_2m") or []
         td2m = h.get("dew_point_2m") or []
         ws10 = h.get("wind_speed_10m") or []
         wd10 = h.get("wind_direction_10m") or []
+        gust10 = h.get("wind_gusts_10m") or []
         ws925 = h.get("wind_speed_925hPa") or []
         wd925 = h.get("wind_direction_925hPa") or []
         ws700 = h.get("wind_speed_700hPa") or []
@@ -145,10 +153,14 @@ class StormfrontConvectiveSource(BaseSource):
                     "cape_j_kg": _fnum(cape, i),
                     "cin_j_kg": _fnum(cin, i),
                     "lifted_index": _fnum(li, i),
+                    "lightning_potential": _fnum(lpi, i),
+                    "freezing_level_m": _fnum(fl, i),
+                    "boundary_layer_m": _fnum(blh, i),
                     "shear_0_6km_ms": shear,
                     "shear_lowmid_ms": shear_lowmid,
                     "wind_u_10m_ms": u10,
                     "wind_v_10m_ms": v10,
+                    "gust_10m_ms": _fnum(gust10, i),
                     "precip_mm": _fnum(precip, i),
                     "cloud_cover_pct": _inum(cloud, i),
                     "temp_c": _fnum(t2m, i),

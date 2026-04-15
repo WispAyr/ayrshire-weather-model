@@ -75,26 +75,36 @@ class StormfrontOutlookLens(BaseLens):
 
         out_days: list[dict] = []
         today = datetime.now(timezone.utc).date()
-        for day_key in sorted(by_day.keys())[:5]:
+        all_day_keys = sorted(by_day.keys())[:5]
+
+        top_day_key: str | None = None
+        top_day_score = -1.0
+        for day_key in all_day_keys:
             rows = by_day[day_key]
             peak_cape, peak_shear, peak_row = 0.0, 0.0, None
+            peak_lpi = 0.0
             total_precip = 0.0
             max_cloud = 0
             for r in rows:
                 c = r.get("cape_j_kg") or 0.0
                 s = r.get("shear_0_6km_ms") or 0.0
+                lp = r.get("lightning_potential") or 0.0
                 if c > peak_cape:
                     peak_cape = c
                     peak_row = r
                 if s > peak_shear:
                     peak_shear = s
+                if lp > peak_lpi:
+                    peak_lpi = lp
                 total_precip += float(r.get("precip_mm") or 0.0)
                 if (r.get("cloud_cover_pct") or 0) > max_cloud:
                     max_cloud = int(r.get("cloud_cover_pct") or 0)
 
             level = _categorical(peak_cape, peak_shear)
-            hazards = _hazards(peak_cape, peak_shear, total_precip)
-            headline = _headline(level, peak_cape, peak_shear, total_precip)
+            hazards = _hazards(peak_cape, peak_shear, total_precip, peak_lpi)
+            headline = _headline(
+                level, peak_cape, peak_shear, total_precip, peak_lpi
+            )
 
             d = date.fromisoformat(day_key)
             if d == today:
@@ -108,6 +118,11 @@ class StormfrontOutlookLens(BaseLens):
             if peak_row and isinstance(peak_row.get("_dt"), datetime):
                 peak_hour = peak_row["_dt"].strftime("%H:%M")
 
+            score = peak_cape * max(1.0, peak_shear) + peak_lpi * 200.0
+            if score > top_day_score:
+                top_day_score = score
+                top_day_key = day_key
+
             out_days.append(
                 {
                     "date": day_key,
@@ -116,12 +131,32 @@ class StormfrontOutlookLens(BaseLens):
                     "headline": headline,
                     "peak_cape": round(peak_cape, 0),
                     "peak_shear": round(peak_shear, 1),
+                    "peak_lpi": round(peak_lpi, 2),
                     "peak_hour": peak_hour,
                     "precip_mm": round(total_precip, 1),
                     "max_cloud_pct": max_cloud,
                     "hazards": hazards,
                 }
             )
+
+        # Build an hour-by-hour strip for the highest-risk day so chaseit
+        # can show chasers exactly when to be on station.
+        top_day_hours: list[dict] = []
+        if top_day_key:
+            for r in by_day[top_day_key]:
+                dt_obj = r.get("_dt")
+                if not isinstance(dt_obj, datetime):
+                    continue
+                top_day_hours.append(
+                    {
+                        "hour": dt_obj.strftime("%H:%M"),
+                        "cape": round(r.get("cape_j_kg") or 0.0, 0),
+                        "shear": round(r.get("shear_0_6km_ms") or 0.0, 1),
+                        "lpi": round(r.get("lightning_potential") or 0.0, 2),
+                        "precip_mm": round(r.get("precip_mm") or 0.0, 1),
+                        "cloud_pct": int(r.get("cloud_cover_pct") or 0),
+                    }
+                )
 
         return {
             "updated": datetime.now(timezone.utc).isoformat(),
@@ -134,6 +169,8 @@ class StormfrontOutlookLens(BaseLens):
             },
             "source": "open-meteo via siphon.stormfront_convective",
             "days": out_days,
+            "top_day": top_day_key,
+            "top_day_hours": top_day_hours,
             "upstream_ok": bool(hourly),
         }
 
@@ -152,7 +189,9 @@ def _categorical(cape: float, shear: float) -> str:
     return "none"
 
 
-def _hazards(cape: float, shear: float, precip: float) -> list[str]:
+def _hazards(
+    cape: float, shear: float, precip: float, lpi: float = 0.0
+) -> list[str]:
     h: list[str] = []
     if cape >= 600:
         h.append("hail")
@@ -162,33 +201,54 @@ def _hazards(cape: float, shear: float, precip: float) -> list[str]:
         h.append("tornado")
     if precip >= 10:
         h.append("flood")
-    if cape >= 100:
+    # LPI is Open-Meteo's dimensionless lightning potential index. Above ~0.5
+    # we treat it as a meaningful electrification signal.
+    if lpi >= 0.5 or cape >= 100:
         h.append("lightning")
     return h
 
 
-def _headline(level: str, cape: float, shear: float, precip: float) -> str:
+def _headline(
+    level: str, cape: float, shear: float, precip: float, lpi: float = 0.0
+) -> str:
+    lightning_tag = ""
+    if lpi >= 2.0:
+        lightning_tag = f" · LPI {lpi:.1f} (strong electrification)"
+    elif lpi >= 0.5:
+        lightning_tag = f" · LPI {lpi:.1f}"
+
     if level == "none":
+        if lpi >= 0.5:
+            return f"Weak electrification only{lightning_tag}."
         return "No significant convection expected."
     if level == "mrgl":
-        return f"Isolated showers / weak storms possible (CAPE ~{cape:.0f} J/kg)."
+        return (
+            f"Isolated showers / weak storms possible (CAPE ~{cape:.0f} J/kg)"
+            f"{lightning_tag}."
+        )
     if level == "slgt":
         if shear >= 15:
-            return f"Organised storms possible — CAPE {cape:.0f}, 0-6km shear {shear:.0f} m/s."
-        return f"Slow-moving multicells / pulse storms (CAPE {cape:.0f})."
+            return (
+                f"Organised storms possible — CAPE {cape:.0f}, 0-6km shear {shear:.0f} m/s"
+                f"{lightning_tag}."
+            )
+        return (
+            f"Slow-moving multicells / pulse storms (CAPE {cape:.0f})"
+            f"{lightning_tag}."
+        )
     if level == "enh":
         return (
             f"Enhanced risk — discrete/clustered storms, hail and wind."
-            f" CAPE {cape:.0f}, shear {shear:.0f} m/s."
+            f" CAPE {cape:.0f}, shear {shear:.0f} m/s{lightning_tag}."
         )
     if level == "mdt":
         return (
             f"Moderate risk — supercell potential, severe hail and wind likely."
-            f" CAPE {cape:.0f}, shear {shear:.0f} m/s."
+            f" CAPE {cape:.0f}, shear {shear:.0f} m/s{lightning_tag}."
         )
     if level == "high":
         return (
             f"High risk — significant severe weather, tornado threat."
-            f" CAPE {cape:.0f}, shear {shear:.0f} m/s."
+            f" CAPE {cape:.0f}, shear {shear:.0f} m/s{lightning_tag}."
         )
     return "Convective risk TBD."
